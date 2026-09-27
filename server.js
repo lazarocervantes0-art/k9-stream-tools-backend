@@ -1,179 +1,313 @@
-require("dotenv").config();
+require('dotenv').config();
 
-const express = require("express");
-const session = require("express-session");
-const crypto = require("crypto");
+const express = require('express');
+const session = require('express-session');
+const crypto = require('crypto');
 
 const app = express();
-app.set("trust proxy", 1);
-app.use(express.json());
-
 const PORT = Number(process.env.PORT || 3000);
-const APP_URL = (process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
-const CLIENT_ID = process.env.KICK_CLIENT_ID || "";
-const CLIENT_SECRET = process.env.KICK_CLIENT_SECRET || "";
-const SCOPES = process.env.KICK_SCOPES || "user:read channel:read";
+const APP_URL = String(process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+const KICK_CLIENT_ID = process.env.KICK_CLIENT_ID || '';
+const KICK_CLIENT_SECRET = process.env.KICK_CLIENT_SECRET || '';
+const KICK_SCOPES = process.env.KICK_SCOPES || 'user:read channel:read';
+const SESSION_SECRET = process.env.SESSION_SECRET || '';
 
-app.use(
-  session({
-    secret: process.env.SESSION_SECRET || "change-me-in-production",
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      secure: APP_URL.startsWith("https://"),
-      sameSite: "lax",
-      maxAge: 1000 * 60 * 60 * 24 * 7
-    }
-  })
-);
-
-function base64url(buffer) {
-  return buffer.toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
+if (!SESSION_SECRET) {
+  console.warn('WARNING: SESSION_SECRET no está configurado. Configúralo en Render antes de usar OAuth.');
 }
 
-function makePkce() {
-  const verifier = base64url(crypto.randomBytes(32));
-  const challenge = base64url(
-    crypto.createHash("sha256").update(verifier).digest()
-  );
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '1mb' }));
+
+const isHttps = APP_URL.startsWith('https://');
+const cookieSecure = isHttps;
+
+app.use(session({
+  name: 'k9.sid',
+  secret: SESSION_SECRET || 'dev-only-change-me',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    secure: cookieSecure,
+    sameSite: 'lax',
+    maxAge: 1000 * 60 * 60 * 24 * 7
+  }
+}));
+
+function base64url(input) {
+  return Buffer.from(input).toString('base64url');
+}
+
+function randomString(bytes = 32) {
+  return crypto.randomBytes(bytes).toString('base64url');
+}
+
+function createPkce() {
+  const verifier = randomString(48);
+  const challenge = crypto
+    .createHash('sha256')
+    .update(verifier)
+    .digest('base64url');
   return { verifier, challenge };
 }
 
-app.get("/health", (_req, res) => {
+function deriveKey() {
+  return crypto.createHash('sha256').update(SESSION_SECRET || 'dev-only-change-me').digest();
+}
+
+// Encrypts the short-lived OAuth transaction so the browser can carry it
+// between /auth/kick and /auth/kick/callback without depending on the
+// express-session store. The cookie is HTTP-only, Secure on HTTPS and SameSite=Lax.
+function encryptOAuthTransaction(payload) {
+  const iv = crypto.randomBytes(12);
+  const key = deriveKey();
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const plaintext = Buffer.from(JSON.stringify(payload));
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString('base64url')}.${tag.toString('base64url')}.${ciphertext.toString('base64url')}`;
+}
+
+function decryptOAuthTransaction(value) {
+  if (!value || typeof value !== 'string') return null;
+  const parts = value.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const [ivB64, tagB64, dataB64] = parts;
+    const iv = Buffer.from(ivB64, 'base64url');
+    const tag = Buffer.from(tagB64, 'base64url');
+    const ciphertext = Buffer.from(dataB64, 'base64url');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', deriveKey(), iv);
+    decipher.setAuthTag(tag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return JSON.parse(plaintext.toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function parseCookies(header) {
+  const result = {};
+  if (!header) return result;
+  for (const part of header.split(';')) {
+    const index = part.indexOf('=');
+    if (index === -1) continue;
+    const key = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim();
+    result[key] = decodeURIComponent(value);
+  }
+  return result;
+}
+
+function setOAuthCookie(res, transaction) {
+  const value = encryptOAuthTransaction(transaction);
+  const parts = [
+    `k9.oauth=${encodeURIComponent(value)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    'Max-Age=600'
+  ];
+  if (cookieSecure) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function clearOAuthCookie(res) {
+  const parts = [
+    'k9.oauth=',
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    'Max-Age=0'
+  ];
+  if (cookieSecure) parts.push('Secure');
+  res.append('Set-Cookie', parts.join('; '));
+}
+
+function timingSafeEqualStrings(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const aa = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
+}
+
+function requireConfig(res) {
+  const missing = [];
+  if (!KICK_CLIENT_ID) missing.push('KICK_CLIENT_ID');
+  if (!KICK_CLIENT_SECRET) missing.push('KICK_CLIENT_SECRET');
+  if (!SESSION_SECRET) missing.push('SESSION_SECRET');
+  if (missing.length) {
+    res.status(500).send(`Faltan variables de entorno: ${missing.join(', ')}`);
+    return false;
+  }
+  return true;
+}
+
+app.get('/health', (req, res) => {
   res.json({
     ok: true,
-    service: "K9 Stream Tools Backend",
+    service: 'K9 Stream Tools Backend',
+    oauth: 'kick',
     time: new Date().toISOString()
   });
 });
 
-app.get("/auth/kick", (req, res) => {
-  if (!CLIENT_ID) {
-    return res.status(500).send("Falta KICK_CLIENT_ID en las variables de entorno.");
-  }
+app.get('/auth/kick', (req, res) => {
+  if (!requireConfig(res)) return;
 
-  const state = base64url(crypto.randomBytes(24));
-  const { verifier, challenge } = makePkce();
+  const state = randomString(32);
+  const { verifier, challenge } = createPkce();
+  const redirectUri = `${APP_URL}/auth/kick/callback`;
 
-  req.session.oauthState = state;
-  req.session.pkceVerifier = verifier;
+  setOAuthCookie(res, {
+    state,
+    verifier,
+    createdAt: Date.now()
+  });
 
   const params = new URLSearchParams({
-    response_type: "code",
-    client_id: CLIENT_ID,
-    redirect_uri: `${APP_URL}/auth/kick/callback`,
-    scope: SCOPES,
+    client_id: KICK_CLIENT_ID,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: KICK_SCOPES,
     state,
     code_challenge: challenge,
-    code_challenge_method: "S256"
+    code_challenge_method: 'S256'
   });
 
   res.redirect(`https://id.kick.com/oauth/authorize?${params.toString()}`);
 });
 
-app.get("/auth/kick/callback", async (req, res) => {
-  const { code, state, error, error_description } = req.query;
+app.get('/auth/kick/callback', async (req, res) => {
+  if (!requireConfig(res)) return;
+
+  const { code, state, error, error_description: errorDescription } = req.query;
 
   if (error) {
-    return res.status(400).send(`KICK OAuth: ${error_description || error}`);
+    clearOAuthCookie(res);
+    return res.status(400).send(`KICK rechazó OAuth: ${errorDescription || error}`);
   }
 
-  if (!code || !state || state !== req.session.oauthState) {
-    return res.status(400).send("OAuth inválido: state o code no coinciden.");
+  if (!code || !state) {
+    clearOAuthCookie(res);
+    return res.status(400).send('OAuth inválido: KICK no devolvió code y state.');
   }
 
-  if (!CLIENT_ID || !CLIENT_SECRET || !req.session.pkceVerifier) {
-    return res.status(500).send("Faltan variables de entorno de KICK/OAuth.");
+  const cookies = parseCookies(req.headers.cookie);
+  const transaction = decryptOAuthTransaction(cookies['k9.oauth']);
+
+  if (!transaction || !transaction.state || !transaction.verifier) {
+    clearOAuthCookie(res);
+    return res.status(400).send('OAuth inválido: falta la cookie de seguridad. Inicia la conexión desde K9 Stream Tools y no desde una URL guardada.');
+  }
+
+  if (Date.now() - Number(transaction.createdAt || 0) > 10 * 60 * 1000) {
+    clearOAuthCookie(res);
+    return res.status(400).send('OAuth expirado: vuelve a iniciar la conexión con KICK.');
+  }
+
+  if (!timingSafeEqualStrings(String(state), String(transaction.state))) {
+    clearOAuthCookie(res);
+    return res.status(400).send('OAuth inválido: state no coincide. Vuelve a iniciar la conexión con KICK desde K9 Stream Tools.');
   }
 
   try {
-    const tokenResponse = await fetch("https://id.kick.com/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        redirect_uri: `${APP_URL}/auth/kick/callback`,
-        code,
-        code_verifier: req.session.pkceVerifier
-      })
+    const redirectUri = `${APP_URL}/auth/kick/callback`;
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: KICK_CLIENT_ID,
+      client_secret: KICK_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      code: String(code),
+      code_verifier: String(transaction.verifier)
     });
 
-    const tokenData = await tokenResponse.json();
+    const tokenResponse = await fetch('https://id.kick.com/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body
+    });
+
+    const tokenText = await tokenResponse.text();
+    let tokenData;
+    try {
+      tokenData = JSON.parse(tokenText);
+    } catch {
+      tokenData = { raw: tokenText };
+    }
 
     if (!tokenResponse.ok) {
-      console.error("KICK token error:", tokenData);
-      return res.status(502).send("KICK rechazó el intercambio del código.");
+      console.error('KICK token error:', tokenResponse.status, tokenData);
+      clearOAuthCookie(res);
+      return res.status(400).send(`KICK rechazó el intercambio del código (${tokenResponse.status}). Revisa Redirect URI, Client ID/Secret y permisos.`);
     }
 
     req.session.kick = {
       accessToken: tokenData.access_token,
-      refreshToken: tokenData.refresh_token,
-      expiresIn: tokenData.expires_in,
-      tokenType: tokenData.token_type
+      refreshToken: tokenData.refresh_token || null,
+      tokenType: tokenData.token_type || 'Bearer',
+      expiresIn: tokenData.expires_in || null,
+      connectedAt: new Date().toISOString()
     };
 
-    delete req.session.oauthState;
-    delete req.session.pkceVerifier;
+    clearOAuthCookie(res);
 
-    res.redirect("/api/me");
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Error conectando con KICK.");
+    res.send(`<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>K9 Stream Tools</title>
+<style>body{font-family:Arial,sans-serif;background:#111;color:#fff;display:grid;place-items:center;min-height:100vh;margin:0}.box{max-width:520px;padding:32px;text-align:center;background:#1c1c1c;border-radius:18px}a{color:#58e6a8}</style></head>
+<body><div class="box"><h1>✅ KICK conectado</h1><p>La autorización terminó correctamente.</p><p><a href="/api/me">Probar conexión con KICK</a></p><p><a href="/">Volver a K9 Stream Tools</a></p></div></body></html>`);
+  } catch (error) {
+    console.error('OAuth callback error:', error);
+    clearOAuthCookie(res);
+    res.status(500).send('Error interno al completar OAuth con KICK. Revisa los logs de Render.');
   }
 });
 
-app.get("/api/me", async (req, res) => {
-  if (!req.session.kick?.accessToken) {
-    return res.status(401).json({
-      connected: false,
-      message: "KICK no está conectado. Usa /auth/kick."
-    });
+app.get('/api/me', async (req, res) => {
+  const accessToken = req.session?.kick?.accessToken;
+  if (!accessToken) {
+    return res.status(401).json({ ok: false, error: 'No hay una sesión de KICK. Conecta primero en /auth/kick.' });
   }
 
   try {
-    const response = await fetch("https://api.kick.com/public/v1/users", {
+    const response = await fetch('https://api.kick.com/public/v1/users', {
       headers: {
-        Authorization: `Bearer ${req.session.kick.accessToken}`,
-        Accept: "application/json"
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json'
       }
     });
 
-    const data = await response.json();
-
-    if (!response.ok) {
-      return res.status(response.status).json(data);
+    const text = await response.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
     }
 
-    res.json({ connected: true, data });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ connected: false, error: "No se pudo consultar KICK." });
+    res.status(response.status).json({ ok: response.ok, data });
+  } catch (error) {
+    console.error('KICK API error:', error);
+    res.status(502).json({ ok: false, error: 'No se pudo contactar la API de KICK.' });
   }
 });
 
-app.post("/webhooks/kick", (req, res) => {
-  console.log("KICK webhook recibido:", req.body);
-  res.sendStatus(204);
+app.post('/webhooks/kick', (req, res) => {
+  res.status(200).json({ ok: true, received: true });
 });
 
-app.get("/", (_req, res) => {
-  res.type("html").send(`
-    <h1>K9 Stream Tools Backend</h1>
-    <p>Backend funcionando.</p>
-    <ul>
-      <li><a href="/health">Health check</a></li>
-      <li><a href="/auth/kick">Conectar con KICK</a></li>
-    </ul>
-  `);
+app.get('/', (req, res) => {
+  const connected = Boolean(req.session?.kick?.accessToken);
+  res.send(`<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>K9 Stream Tools Backend</title>
+<style>body{font-family:Arial,sans-serif;background:#101010;color:#fff;margin:0;padding:40px}.card{max-width:700px;margin:auto;background:#1b1b1b;border-radius:18px;padding:28px}a{color:#58e6a8}li{margin:10px 0}</style></head>
+<body><div class="card"><h1>🐺 K9 Stream Tools Backend</h1><p>Backend activo.</p><ul><li><a href="/health">Health check</a></li><li><a href="/auth/kick">${connected ? 'Volver a conectar KICK' : 'Conectar con KICK'}</a></li><li><a href="/api/me">Probar /api/me</a></li></ul><p>Estado de sesión: <strong>${connected ? 'conectado' : 'no conectado'}</strong></p></div></body></html>`);
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`K9 Stream Tools Backend escuchando en ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`K9 Stream Tools Backend escuchando en 0.0.0.0:${PORT}`);
   console.log(`APP_URL: ${APP_URL}`);
+  console.log(`OAuth callback: ${APP_URL}/auth/kick/callback`);
 });

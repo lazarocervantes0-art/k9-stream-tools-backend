@@ -1,58 +1,56 @@
-# K9 Stream Tools — Backend
+# K9 Stream Tools Backend — OAuth corregido
 
-Backend inicial para conectar K9 Stream Tools con KICK mediante OAuth 2.0 + PKCE.
+Versión 1.1.0. Corrige el problema de `OAuth inválido: state o code no coinciden` evitando depender de `express-session` para transportar el estado temporal de OAuth.
 
-## Archivos
+## Qué cambia
 
-- `package.json` — dependencias y comando de inicio.
-- `server.js` — servidor Express y flujo OAuth.
-- `.env.example` — plantilla de variables.
-- `.gitignore` — evita publicar secretos.
-- `README.md` — instrucciones.
+- OAuth de KICK usa Authorization Code + PKCE.
+- `state` + PKCE verifier se guardan en una cookie temporal cifrada, HttpOnly, SameSite=Lax y Secure cuando se usa HTTPS.
+- La sesión de Express se mantiene para el access token después del login.
+- El callback valida `state`, caducidad y la integridad de la cookie.
+- No requiere cambiar el Client ID ni el Client Secret.
+
+## Variables de Render
+
+Mantén estas variables:
+
+- `KICK_CLIENT_ID` = Client ID de tu app KICK
+- `KICK_CLIENT_SECRET` = Client Secret de tu app KICK
+- `SESSION_SECRET` = secreto largo y aleatorio
+- `APP_URL` = URL exacta de tu servicio Render, sin `/` final
+- `KICK_SCOPES` = los scopes que hayas habilitado en tu app de KICK
+
+`PORT` puede dejarse sin configurar en Render; Render lo proporciona.
+
+## Redirect URI
+
+En KICK Developer debe existir exactamente:
+
+`https://TU-SERVICIO.onrender.com/auth/kick/callback`
+
+No pongas `/` al final.
 
 ## Render
 
 Build Command:
 
-```bash
-npm install
-```
+`npm install`
 
 Start Command:
 
-```bash
-npm start
-```
+`npm start`
 
-Runtime: Node.
+Después de cambiar el código, haz Manual Deploy / Deploy latest commit.
 
-Cuando Render entregue la URL HTTPS, configura:
+## Prueba
 
-```text
-APP_URL=https://TU-URL.onrender.com
-```
+1. Abre `https://TU-SERVICIO.onrender.com/health`.
+2. Abre `https://TU-SERVICIO.onrender.com/`.
+3. Pulsa `Conectar con KICK`.
+4. Autoriza la app.
+5. Debe aparecer `KICK conectado`.
+6. Pulsa `Probar conexión con KICK`.
 
-Y en KICK Dev usa como Redirect URL:
+## Importante
 
-```text
-https://TU-URL.onrender.com/auth/kick/callback
-```
-
-## Variables privadas
-
-Configura en Render:
-
-- `KICK_CLIENT_ID`
-- `KICK_CLIENT_SECRET`
-- `SESSION_SECRET`
-- `APP_URL`
-- `KICK_SCOPES`
-
-Nunca publiques `.env` ni `KICK_CLIENT_SECRET`.
-
-## Pruebas
-
-- `/health` debe responder JSON con `ok: true`.
-- `/auth/kick` inicia la conexión con KICK.
-
-La API y los permisos exactos disponibles deben configurarse según la documentación vigente de KICK Dev.
+Nunca subas `.env` ni el Client Secret a GitHub. El secreto debe permanecer únicamente en Render Environment Variables.
